@@ -261,10 +261,6 @@ create_archive() {
         fi
     done < "$final_list"
     
-    if [ $final_list -gt 0 ]; then
-        error "all file(s)/directory(ies) not found"
-    fi
-    
     # Create the archive using tar with file list
     info "Creating tar archive..."
     if [ "$COMPRESSION" = "LZ" ]; then
@@ -373,6 +369,7 @@ extract_archive() {
             mv "$remaining" "$filtered_contents"
         fi
         
+        # Check if any file remain after filtering
         if [ ! -s "$filtered_contents" ]; then
             rm -f "$archive_contents" "$filtered_contents"
             error "No files to extract after applying filters"

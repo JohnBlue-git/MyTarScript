@@ -441,7 +441,11 @@ extract_archive() {
     staging_dir=$(mktemp -d) || { rm -f "$filtered_contents"; error "Cannot create staging directory"; }
     chmod 700 "$staging_dir"
     info "Extracting into staging directory..."
-    tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" 2>/dev/null || true
+    if ! tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" 2>/dev/null; then
+         rm -f "$filtered_contents"
+         rm -rf "$staging_dir"
+         error "Extraction failed"
+    fi
 
     # Move only expected files to the final destination
     info "Moving validated files to destination: $dest_dir"

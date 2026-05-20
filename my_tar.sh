@@ -136,15 +136,15 @@ ARCHIVE_EXT=""
 if [ -n "$COMPRESSION" ]; then
     case "$COMPRESSION" in
         GZ)
-            COMP_FLAG="z"
+            COMP_FLAG="-z"
             ARCHIVE_EXT=".gz"
             ;;
         BZ2)
-            COMP_FLAG="j"
+            COMP_FLAG="-j"
             ARCHIVE_EXT=".bz2"
             ;;
         XZ)
-            COMP_FLAG="J"
+            COMP_FLAG="-J"
             ARCHIVE_EXT=".xz"
             ;;
         LZ)
@@ -189,7 +189,8 @@ read_file_list() {
 
 # Function to create archive
 create_archive() {
-    local tar_opts="c${COMP_FLAG}vf"
+    local tar_opts=("-c" "-v" "-f")
+    [ -n "$COMP_FLAG" ] && tar_opts=("-c" "$COMP_FLAG" "-v" "-f")
     local archive_name="$ARCHIVE"
     local temp_list=""
     local final_list=""
@@ -266,7 +267,7 @@ create_archive() {
     if [ "$COMPRESSION" = "LZ" ]; then
         tar cvf - -T "$final_list" --ignore-failed-read 2>/dev/null | lzip > "$archive_name"
     else
-        tar $tar_opts "$archive_name" -T "$final_list" --ignore-failed-read 2>/dev/null
+        tar "${tar_opts[@]}" "$archive_name" -T "$final_list" --ignore-failed-read 2>/dev/null
     fi
     
     # Cleanup
@@ -282,22 +283,23 @@ create_archive() {
 
 # Function to extract archive
 extract_archive() {
-    local tar_opts="x${COMP_FLAG}vf"
+    local tar_opts=("-x" "-v" "-f")
+    [ -n "$COMP_FLAG" ] && tar_opts=("-x" "$COMP_FLAG" "-v" "-f")
     local archive_name="$ARCHIVE"
     
     # Auto-detect compression if not specified
     if [ -z "$COMPRESSION" ]; then
         case "$archive_name" in
             *.tar.gz|*.tgz)
-                COMP_FLAG="z"
+                COMP_FLAG="-z"
                 info "Auto-detected gzip compression"
                 ;;
             *.tar.bz2|*.tbz2)
-                COMP_FLAG="j"
+                COMP_FLAG="-j"
                 info "Auto-detected bzip2 compression"
                 ;;
             *.tar.xz|*.txz)
-                COMP_FLAG="J"
+                COMP_FLAG="-J"
                 info "Auto-detected xz compression"
                 ;;
             *.tar.lz|*.tlz)
@@ -311,7 +313,11 @@ extract_archive() {
                 warn "Cannot auto-detect compression from filename, trying without compression"
                 ;;
         esac
-        tar_opts="x${COMP_FLAG}vf"
+        if [ -n "$COMP_FLAG" ]; then
+            tar_opts=("-x" "$COMP_FLAG" "-v" "-f")
+        else
+            tar_opts=("-x" "-v" "-f")
+        fi
     fi
     
     if [ ! -f "$archive_name" ]; then
@@ -327,11 +333,9 @@ extract_archive() {
     if [ -n "$SELECT_FILE" ] || [ -n "$SKIP_FILE" ]; then
         # List contents of archive
         local archive_contents=$(mktemp)
-        if [[ "$tar_opts" =~ "lzip" ]]; then
-            tar t${COMP_FLAG}f "$archive_name" > "$archive_contents" 2>/dev/null
-        else
-            tar t${COMP_FLAG}f "$archive_name" > "$archive_contents" 2>/dev/null
-        fi
+        local list_opts=("-t" "-f")
+        [ -n "$COMP_FLAG" ] && list_opts=("-t" "$COMP_FLAG" "-f")
+        tar "${list_opts[@]}" "$archive_name" > "$archive_contents" 2>/dev/null
         
         local filtered_contents=$(mktemp)
         cp "$archive_contents" "$filtered_contents"
@@ -344,7 +348,7 @@ extract_archive() {
             
             local selected=$(mktemp)
             while IFS= read -r pattern; do
-                grep "^${pattern}" "$filtered_contents" || true
+                grep -Fx -e "${pattern}" -e "./${pattern}" "$filtered_contents" || true
             done < "$select_temp" > "$selected"
             
             rm -f "$select_temp"
@@ -361,7 +365,7 @@ extract_archive() {
             cp "$filtered_contents" "$remaining"
             
             while IFS= read -r pattern; do
-                grep -v "^${pattern}" "$remaining" > "${remaining}.new" || true
+                grep -Fxv -e "${pattern}" -e "./${pattern}" "$remaining" > "${remaining}.new" || true
                 mv "${remaining}.new" "$remaining"
             done < "$skip_temp"
             
@@ -377,13 +381,13 @@ extract_archive() {
         
         # Extract filtered files
         info "Extracting filtered files..."
-        tar $tar_opts "$archive_name" -T "$filtered_contents" 2>/dev/null
+        tar "${tar_opts[@]}" "$archive_name" -T "$filtered_contents" 2>/dev/null
         
         rm -f "$archive_contents" "$filtered_contents"
     else
         # Extract all
         info "Extracting all files..."
-        tar $tar_opts "$archive_name" 2>/dev/null
+        tar "${tar_opts[@]}" "$archive_name" 2>/dev/null
     fi
     
     info "Extraction completed successfully"

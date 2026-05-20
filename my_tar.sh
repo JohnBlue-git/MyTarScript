@@ -72,6 +72,25 @@ warn() {
     echo -e "${YELLOW}WARNING: $1${NC}"
 }
 
+# Function to validate an archive entry path against traversal attacks
+# Returns 0 if safe, 1 if unsafe
+validate_entry() {
+    local entry="$1"
+    # Reject absolute paths (starting with /)
+    if [[ "$entry" == /* ]]; then
+        return 1
+    fi
+    # Reject any '..' path component (covers /../, ../, /.., and standalone ..)
+    if [[ "$entry" =~ (^|/)\.\./(/|$) ]] || [[ "$entry" == ".." ]] || [[ "$entry" == "../"* ]] || [[ "$entry" == *"/.." ]]; then
+        return 1
+    fi
+    # Reject Windows-style backslash path traversal (e.g., ..\ )
+    if [[ "$entry" =~ \.\.\\ ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -283,10 +302,17 @@ create_archive() {
 
 # Function to extract archive
 extract_archive() {
+    # Resolve archive to absolute path before any directory change
+    local archive_name
+    if [[ "$ARCHIVE" == /* ]]; then
+        archive_name="$ARCHIVE"
+    else
+        archive_name="$(pwd)/$ARCHIVE"
+    fi
+
     local tar_opts=("-x" "-v" "-f")
     [ -n "$COMP_FLAG" ] && tar_opts=("-x" "$COMP_FLAG" "-v" "-f")
-    local archive_name="$ARCHIVE"
-    
+
     # Auto-detect compression if not specified
     if [ -z "$COMPRESSION" ]; then
         case "$archive_name" in
@@ -319,77 +345,128 @@ extract_archive() {
             tar_opts=("-x" "-v" "-f")
         fi
     fi
-    
+
     if [ ! -f "$archive_name" ]; then
         error "Archive file does not exist: $archive_name"
     fi
-    
+
     info "Extracting archive: $archive_name"
     info "Destination directory: $WORKING_DIR"
-    
-    cd "$WORKING_DIR" || error "Cannot change to working directory: $WORKING_DIR"
-    
-    # Extract with filters if specified
-    if [ -n "$SELECT_FILE" ] || [ -n "$SKIP_FILE" ]; then
-        # List contents of archive
-        local archive_contents=$(mktemp)
-        local list_opts=("-t" "-f")
-        [ -n "$COMP_FLAG" ] && list_opts=("-t" "$COMP_FLAG" "-f")
-        tar "${list_opts[@]}" "$archive_name" > "$archive_contents" 2>/dev/null
-        
-        local filtered_contents=$(mktemp)
-        cp "$archive_contents" "$filtered_contents"
-        
-        # Apply select filter
-        if [ -n "$SELECT_FILE" ]; then
-            info "Applying select filter"
-            local select_temp=$(mktemp)
-            read_file_list "$SELECT_FILE" "Select" > "$select_temp"
-            
-            local selected=$(mktemp)
-            while IFS= read -r pattern; do
-                grep -Fx -e "${pattern}" -e "./${pattern}" "$filtered_contents" || true
-            done < "$select_temp" > "$selected"
-            
-            rm -f "$select_temp"
-            mv "$selected" "$filtered_contents"
+
+    # Resolve destination to absolute path
+    local dest_dir
+    dest_dir=$(cd "$WORKING_DIR" && pwd) || error "Cannot access working directory: $WORKING_DIR"
+
+    # List all entries in the archive
+    info "Listing archive entries..."
+    local list_opts=("-t" "-f")
+    [ -n "$COMP_FLAG" ] && list_opts=("-t" "$COMP_FLAG" "-f")
+    local archive_contents
+    archive_contents=$(mktemp) || error "Cannot create temp file"
+    tar "${list_opts[@]}" "$archive_name" > "$archive_contents" 2>/dev/null \
+        || { rm -f "$archive_contents"; error "Failed to list archive contents: $archive_name"; }
+
+    # Validate each entry - reject path traversal attempts
+    info "Validating archive entries..."
+    local validated_contents
+    validated_contents=$(mktemp) || { rm -f "$archive_contents"; error "Cannot create temp file"; }
+    local rejected=0
+    while IFS= read -r entry; do
+        if validate_entry "$entry"; then
+            echo "$entry" >> "$validated_contents"
+        else
+            warn "Rejecting unsafe entry: $entry"
+            rejected=$((rejected + 1))
         fi
-        
-        # Apply skip filter
-        if [ -n "$SKIP_FILE" ]; then
-            info "Applying skip filter"
-            local skip_temp=$(mktemp)
-            read_file_list "$SKIP_FILE" "Skip" > "$skip_temp"
-            
-            local remaining=$(mktemp)
-            cp "$filtered_contents" "$remaining"
-            
-            while IFS= read -r pattern; do
-                grep -Fxv -e "${pattern}" -e "./${pattern}" "$remaining" > "${remaining}.new" || true
-                mv "${remaining}.new" "$remaining"
-            done < "$skip_temp"
-            
-            rm -f "$skip_temp"
-            mv "$remaining" "$filtered_contents"
-        fi
-        
-        # Check if any file remain after filtering
-        if [ ! -s "$filtered_contents" ]; then
-            rm -f "$archive_contents" "$filtered_contents"
-            error "No files to extract after applying filters"
-        fi
-        
-        # Extract filtered files
-        info "Extracting filtered files..."
-        tar "${tar_opts[@]}" "$archive_name" -T "$filtered_contents" 2>/dev/null
-        
-        rm -f "$archive_contents" "$filtered_contents"
-    else
-        # Extract all
-        info "Extracting all files..."
-        tar "${tar_opts[@]}" "$archive_name" 2>/dev/null
+    done < "$archive_contents"
+    rm -f "$archive_contents"
+
+    if [ "$rejected" -gt 0 ]; then
+        warn "$rejected unsafe path(s) rejected from archive"
     fi
-    
+
+    if [ ! -s "$validated_contents" ]; then
+        rm -f "$validated_contents"
+        error "No safe entries found in archive"
+    fi
+
+    # Apply select/skip filters on validated entries
+    local filtered_contents
+    filtered_contents=$(mktemp) || { rm -f "$validated_contents"; error "Cannot create temp file"; }
+    cp "$validated_contents" "$filtered_contents"
+    rm -f "$validated_contents"
+
+    if [ -n "$SELECT_FILE" ]; then
+        info "Applying select filter"
+        local select_temp
+        select_temp=$(mktemp)
+        read_file_list "$SELECT_FILE" "Select" > "$select_temp"
+
+        local selected
+        selected=$(mktemp)
+        while IFS= read -r pattern; do
+            grep -Fx -e "${pattern}" -e "./${pattern}" "$filtered_contents" || true
+        done < "$select_temp" > "$selected"
+
+        rm -f "$select_temp" "$filtered_contents"
+        filtered_contents="$selected"
+    fi
+
+    if [ -n "$SKIP_FILE" ]; then
+        info "Applying skip filter"
+        local skip_temp
+        skip_temp=$(mktemp)
+        read_file_list "$SKIP_FILE" "Skip" > "$skip_temp"
+
+        local remaining
+        remaining=$(mktemp)
+        cp "$filtered_contents" "$remaining"
+
+        while IFS= read -r pattern; do
+            grep -Fxv -e "${pattern}" -e "./${pattern}" "$remaining" > "${remaining}.new" || true
+            mv "${remaining}.new" "$remaining"
+        done < "$skip_temp"
+
+        rm -f "$skip_temp" "$filtered_contents"
+        filtered_contents="$remaining"
+    fi
+
+    if [ ! -s "$filtered_contents" ]; then
+        rm -f "$filtered_contents"
+        error "No files to extract after applying filters"
+    fi
+
+    # Extract into a private staging directory with restrictive permissions
+    local staging_dir
+    staging_dir=$(mktemp -d) || { rm -f "$filtered_contents"; error "Cannot create staging directory"; }
+    chmod 700 "$staging_dir"
+    info "Extracting into staging directory..."
+    tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" 2>/dev/null || true
+
+    # Move only expected files to the final destination
+    info "Moving validated files to destination: $dest_dir"
+    local move_count=0
+    while IFS= read -r entry; do
+        local clean_entry="${entry#./}"   # strip leading ./
+        clean_entry="${clean_entry%/}"    # strip trailing /
+        [ -z "$clean_entry" ] && continue
+
+        local src="$staging_dir/$clean_entry"
+        if [ -e "$src" ]; then
+            local dest_path="$dest_dir/$clean_entry"
+            mkdir -p "$(dirname "$dest_path")"
+            mv -f "$src" "$dest_path"
+            move_count=$((move_count + 1))
+        else
+            warn "Expected entry not found after extraction: $clean_entry"
+        fi
+    done < "$filtered_contents"
+
+    # Cleanup
+    rm -f "$filtered_contents"
+    rm -rf "$staging_dir"
+
+    info "Moved $move_count item(s) to destination"
     info "Extraction completed successfully"
 }
 

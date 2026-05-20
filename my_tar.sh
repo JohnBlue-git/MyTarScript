@@ -72,6 +72,16 @@ warn() {
     echo -e "${YELLOW}WARNING: $1${NC}"
 }
 
+# Temp file/dir tracking for guaranteed cleanup on all exit paths (success, error, signal)
+TEMP_FILES=()
+TEMP_DIRS=()
+
+cleanup() {
+    [[ ${#TEMP_FILES[@]} -gt 0 ]] && rm -f "${TEMP_FILES[@]}"
+    [[ ${#TEMP_DIRS[@]} -gt 0 ]]  && rm -rf "${TEMP_DIRS[@]}"
+}
+trap cleanup EXIT
+
 # Function to validate an archive entry path against traversal attacks
 # Returns 0 if safe, 1 if unsafe
 validate_entry() {
@@ -228,11 +238,13 @@ create_archive() {
     if [ -n "$SELECT_FILE" ]; then
         info "Reading select file: $SELECT_FILE"
         temp_list=$(mktemp)
+        TEMP_FILES+=("$temp_list")
         read_file_list "$SELECT_FILE" "Select" > "$temp_list"
         final_list="$temp_list"
     else
         # Use all files in current directory
         temp_list=$(mktemp)
+        TEMP_FILES+=("$temp_list")
         find . -maxdepth 1 ! -path . | sed 's|^\./||' > "$temp_list"
         final_list="$temp_list"
     fi
@@ -241,10 +253,12 @@ create_archive() {
     if [ -n "$SKIP_FILE" ]; then
         info "Reading skip file: $SKIP_FILE"
         local skip_temp=$(mktemp)
+        TEMP_FILES+=("$skip_temp")
         read_file_list "$SKIP_FILE" "Skip" > "$skip_temp"
         
         # Filter out skipped items
         local filtered_list=$(mktemp)
+        TEMP_FILES+=("$filtered_list")
         while IFS= read -r item; do
             local skip_item=0
             while IFS= read -r skip_pattern; do
@@ -363,13 +377,15 @@ extract_archive() {
     [ -n "$COMP_FLAG" ] && list_opts=("-t" "$COMP_FLAG" "-f")
     local archive_contents
     archive_contents=$(mktemp) || error "Cannot create temp file"
+    TEMP_FILES+=("$archive_contents")
     tar "${list_opts[@]}" "$archive_name" > "$archive_contents" 2>/dev/null \
         || { rm -f "$archive_contents"; error "Failed to list archive contents: $archive_name"; }
 
     # Validate each entry - reject path traversal attempts
     info "Validating archive entries..."
     local validated_contents
-    validated_contents=$(mktemp) || { rm -f "$archive_contents"; error "Cannot create temp file"; }
+    validated_contents=$(mktemp) || error "Cannot create temp file"
+    TEMP_FILES+=("$validated_contents")
     local rejected=0
     while IFS= read -r entry; do
         if validate_entry "$entry"; then
@@ -392,7 +408,8 @@ extract_archive() {
 
     # Apply select/skip filters on validated entries
     local filtered_contents
-    filtered_contents=$(mktemp) || { rm -f "$validated_contents"; error "Cannot create temp file"; }
+    filtered_contents=$(mktemp) || error "Cannot create temp file"
+    TEMP_FILES+=("$filtered_contents")
     cp "$validated_contents" "$filtered_contents"
     rm -f "$validated_contents"
 
@@ -400,10 +417,12 @@ extract_archive() {
         info "Applying select filter"
         local select_temp
         select_temp=$(mktemp)
+        TEMP_FILES+=("$select_temp")
         read_file_list "$SELECT_FILE" "Select" > "$select_temp"
 
         local selected
         selected=$(mktemp)
+        TEMP_FILES+=("$selected")
         while IFS= read -r pattern; do
             grep -Fx -e "${pattern}" -e "./${pattern}" "$filtered_contents" || true
         done < "$select_temp" > "$selected"
@@ -416,10 +435,12 @@ extract_archive() {
         info "Applying skip filter"
         local skip_temp
         skip_temp=$(mktemp)
+        TEMP_FILES+=("$skip_temp")
         read_file_list "$SKIP_FILE" "Skip" > "$skip_temp"
 
         local remaining
         remaining=$(mktemp)
+        TEMP_FILES+=("$remaining")
         cp "$filtered_contents" "$remaining"
 
         while IFS= read -r pattern; do
@@ -438,14 +459,18 @@ extract_archive() {
 
     # Extract into a private staging directory with restrictive permissions
     local staging_dir
-    staging_dir=$(mktemp -d) || { rm -f "$filtered_contents"; error "Cannot create staging directory"; }
+    staging_dir=$(mktemp -d) || error "Cannot create staging directory"
+    TEMP_DIRS+=("$staging_dir")
     chmod 700 "$staging_dir"
     info "Extracting into staging directory..."
-    if ! tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" 2>/dev/null; then
+    # --no-same-owner / --no-same-permissions prevent the archive from imposing
+    # arbitrary ownership or permission bits on the extracted files.
+    if ! tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" \
+             --no-same-owner --no-same-permissions 2>/dev/null; then
          rm -f "$filtered_contents"
          rm -rf "$staging_dir"
          error "Extraction failed"
-    fi
+     fi
 
     # Move only expected files to the final destination
     info "Moving validated files to destination: $dest_dir"
@@ -457,9 +482,18 @@ extract_archive() {
 
         local src="$staging_dir/$clean_entry"
         if [ -e "$src" ]; then
+            # Reject symlinks and special files (devices, FIFOs, sockets, …).
+            # Only plain regular files are permitted in the destination.
+            if [[ -L "$src" ]] || [[ ! -f "$src" ]]; then
+                warn "Skipping non-regular file (symlink or special file): $clean_entry"
+                continue
+            fi
             local dest_path="$dest_dir/$clean_entry"
             mkdir -p "$(dirname "$dest_path")"
             mv -f "$src" "$dest_path"
+            # Normalize permissions so the archive cannot leave world-writable
+            # or executable bits that it should not have.
+            chmod 0644 "$dest_path"
             move_count=$((move_count + 1))
         else
             warn "Expected entry not found after extraction: $clean_entry"

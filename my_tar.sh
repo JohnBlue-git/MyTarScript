@@ -4,7 +4,7 @@
 # Description: Archive/Extract files using tar with compression options and selective file handling
 # Usage: my_tar.sh [--dir=PATH] <archive.tar> --mode=create|extract [--comp=GZ|BZ2|XZ|LZ] [--select=<package_list.txt>] [--skip=<skip_list.txt>]
 
-set -e  # Exit on error
+set -euo pipefail  # Exit on errors, unset variables, and pipeline failures
 
 # Default values
 WORKING_DIR="."

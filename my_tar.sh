@@ -77,8 +77,12 @@ TEMP_FILES=()
 TEMP_DIRS=()
 
 cleanup() {
-    [[ ${#TEMP_FILES[@]} -gt 0 ]] && rm -f "${TEMP_FILES[@]}"
-    [[ ${#TEMP_DIRS[@]} -gt 0 ]]  && rm -rf "${TEMP_DIRS[@]}"
+    if [[ ${#TEMP_FILES[@]} -gt 0 ]]; then
+        rm -f "${TEMP_FILES[@]}"
+    fi
+    if [[ ${#TEMP_DIRS[@]} -gt 0 ]]; then
+        rm -rf "${TEMP_DIRS[@]}"
+    fi
 }
 trap cleanup EXIT
 
@@ -295,14 +299,22 @@ create_archive() {
         fi
     done < "$final_list"
     
-    # Create the archive using tar with file list
+    # Create the archive using tar with file list.
+    # Capture tar exit code explicitly so set -e does not abort on a warning (exit 1).
     info "Creating tar archive..."
+    local tar_rc=0
     if [ "$COMPRESSION" = "LZ" ]; then
-        tar cvf - -T "$final_list" --ignore-failed-read 2>/dev/null | lzip > "$archive_name"
+        tar cvf - -T "$final_list" 2>/dev/null | lzip > "$archive_name" || tar_rc=$?
     else
-        tar "${tar_opts[@]}" "$archive_name" -T "$final_list" --ignore-failed-read 2>/dev/null
+        tar "${tar_opts[@]}" "$archive_name" -T "$final_list" 2>/dev/null || tar_rc=$?
     fi
-    
+    # Exit code 1 from GNU tar means "some files had warnings" — treat it as non-fatal.
+    # Exit code 2 (or higher) is a fatal error.
+    if [ "$tar_rc" -gt 1 ]; then
+        rm -f "$final_list"
+        error "tar exited with fatal error (exit code $tar_rc)"
+    fi
+
     # Cleanup
     rm -f "$final_list"
     
@@ -465,12 +477,15 @@ extract_archive() {
     info "Extracting into staging directory..."
     # --no-same-owner / --no-same-permissions prevent the archive from imposing
     # arbitrary ownership or permission bits on the extracted files.
-    if ! tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" \
-             --no-same-owner --no-same-permissions 2>/dev/null; then
-         rm -f "$filtered_contents"
-         rm -rf "$staging_dir"
-         error "Extraction failed"
-     fi
+    local extract_rc=0
+    tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" \
+        --no-same-owner --no-same-permissions 2>/dev/null || extract_rc=$?
+    # Exit code 1 = warnings (non-fatal); exit code 2+ = fatal.
+    if [ "$extract_rc" -gt 1 ]; then
+        rm -f "$filtered_contents"
+        rm -rf "$staging_dir"
+        error "Extraction failed (tar exit code $extract_rc)"
+    fi
 
     # Move only expected files to the final destination
     info "Moving validated files to destination: $dest_dir"

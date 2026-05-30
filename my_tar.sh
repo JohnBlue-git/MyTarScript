@@ -69,7 +69,7 @@ info() {
 
 # Function to print warning messages
 warn() {
-    echo -e "${YELLOW}WARNING: $1${NC}"
+    echo -e "${YELLOW}WARNING: $1${NC}" >&2
 }
 
 # Temp file/dir tracking for guaranteed cleanup on all exit paths (success, error, signal)
@@ -283,8 +283,15 @@ create_archive() {
         final_list="$filtered_list"
     fi
     
+    # Allow explicit empty select list by creating a valid empty archive.
+    # This keeps behavior predictable for automation and tests.
+    if [ ! -s "$final_list" ] && [ -n "$SELECT_FILE" ]; then
+        warn "Select file produced no entries; creating an empty archive"
+        : > "$final_list"
+    fi
+
     # Check if we have any files to archive
-    if [ ! -s "$final_list" ]; then
+    if [ ! -s "$final_list" ] && [ -z "$SELECT_FILE" ]; then
         rm -f "$final_list"
         error "No files to archive after applying filters"
     fi
@@ -306,7 +313,11 @@ create_archive() {
     if [ "$COMPRESSION" = "LZ" ]; then
         tar cvf - -T "$final_list" 2>/dev/null | lzip > "$archive_name" || tar_rc=$?
     else
-        tar "${tar_opts[@]}" "$archive_name" -T "$final_list" 2>/dev/null || tar_rc=$?
+        if [ -s "$final_list" ]; then
+            tar "${tar_opts[@]}" "$archive_name" -T "$final_list" 2>/dev/null || tar_rc=$?
+        else
+            tar "${tar_opts[@]}" "$archive_name" -T /dev/null 2>/dev/null || tar_rc=$?
+        fi
     fi
     # Exit code 1 from GNU tar means "some files had warnings" — treat it as non-fatal.
     # Exit code 2 (or higher) is a fatal error.
@@ -478,7 +489,7 @@ extract_archive() {
     # --no-same-owner / --no-same-permissions prevent the archive from imposing
     # arbitrary ownership or permission bits on the extracted files.
     local extract_rc=0
-    tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" -T "$filtered_contents" \
+    tar "${tar_opts[@]}" "$archive_name" -C "$staging_dir" \
         --no-same-owner --no-same-permissions 2>/dev/null || extract_rc=$?
     # Exit code 1 = warnings (non-fatal); exit code 2+ = fatal.
     if [ "$extract_rc" -gt 1 ]; then
